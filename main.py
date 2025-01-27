@@ -2,76 +2,66 @@
 import re
 import os
 import time
+import logging
 import pyudev
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# ==========================
-# Регулярные выражения
-# ==========================
-# - Примеры довольно упрощены.
+# Настраиваем логирование: и в файл, и в консоль.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("confidata_guard.log", mode='a', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 
-# Пример номера телефона (только для демонстрации), 
-# ищет последовательность из 7-11 цифр, допускает символы +, -, пробелы и скобки.
+# ==========================
+# Регулярные выражения 
+# ==========================
 PHONE_REGEX = re.compile(r"(?:\+?\d[\d\-\(\)\s]{5,14}\d)")
-
-# Пример номера банковской карты (16 цифр, допускаются пробелы)
 CARD_REGEX = re.compile(r"(?:\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b)")
-
-# Упрощённый пример паспортных данных (серия и номер, 10-12 цифр подряд или с пробелом).
 PASSPORT_REGEX = re.compile(r"\b\d{2}\s?\d{2}\s?\d{6}\b")
 
-
 def contains_sensitive_data(file_path):
-    """
-    Проверяем содержимое файла на наличие конфиденциальной информации.
-    Если находим совпадение - возвращаем True.
-    """
+    """Проверяем содержимое файла на наличие конфиденциальной информации."""
     if not os.path.isfile(file_path):
         return False
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            if (PHONE_REGEX.search(content) or 
-                CARD_REGEX.search(content) or 
+            if (PHONE_REGEX.search(content) or
+                CARD_REGEX.search(content) or
                 PASSPORT_REGEX.search(content)):
                 return True
     except Exception as e:
-        # В случае ошибки чтения файла — можно либо логировать, либо пропускать.
-        print(f"[!] Ошибка при проверке файла {file_path}: {e}")
+        logging.warning(f"Ошибка при проверке файла {file_path}: {e}")
     return False
 
-
 class UsbCopyHandler(FileSystemEventHandler):
-    """
-    Обработчик событий в директории смонтированной флешки.
-    Если появляется новый файл, проверяем содержимое и, при необходимости, удаляем.
-    """
+    """Обработчик для watchdog, реагируем на создание новых файлов."""
     def on_created(self, event):
         if not event.is_directory:
             file_path = event.src_path
-            print(f"[INFO] Обнаружен новый файл: {file_path}")
+            logging.info(f"Новый файл: {file_path}")
 
             if contains_sensitive_data(file_path):
-                print(f"[ALERT] Конфиденциальная информация обнаружена в файле: {file_path}")
+                logging.warning(f"Конфиденциальная информация в файле: {file_path}")
                 try:
                     os.remove(file_path)
-                    print(f"[ACTION] Файл '{file_path}' был удалён для предотвращения утечки данных.")
+                    logging.info(f"Файл '{file_path}' удалён.")
                 except Exception as e:
-                    print(f"[ERROR] Не удалось удалить файл '{file_path}': {e}")
-
+                    logging.error(f"Не удалось удалить файл '{file_path}': {e}")
 
 def monitor_usb_mount(mount_path):
-    """
-    Функция запускает слежение за директорией, где смонтирована USB-флешка.
-    Используем watchdog для отслеживания появления новых файлов.
-    """
+    """Запускаем слежение за директорией, где смонтирована флешка."""
     event_handler = UsbCopyHandler()
     observer = Observer()
     observer.schedule(event_handler, mount_path, recursive=True)
     observer.start()
 
-    print(f"[INFO] Запущен мониторинг в: {mount_path}")
+    logging.info(f"Слежение запущено в: {mount_path}")
 
     try:
         while True:
@@ -80,46 +70,10 @@ def monitor_usb_mount(mount_path):
         observer.stop()
     observer.join()
 
-
-def main():
-    """
-    Главная функция:
-    1. Отслеживаем через pyudev появление новых устройств типа 'disk' (USB).
-    2. Когда устройство появляется, предполагаем, что оно монтируется в /media или /run/media и т.д.
-    3. Запускаем мониторинг изменений в смонтированной директории.
-    """
-    context = pyudev.Context()
-    monitor = pyudev.Monitor.from_netlink(context)
-    monitor.filter_by(subsystem='block', device_type='disk')
-
-    print("[INFO] Ожидание подключения USB-устройств...")
-    
-    for device in iter(monitor.poll, None):
-        # Здесь можно уточнять, действительно ли это USB (DRIVER = 'usb', ID_BUS = 'usb' и т.п.)
-        if device.action == 'add':
-            print(f"[INFO] Устройство добавлено: {device.device_node}")
-
-            # Обычно нужно подождать, пока система смонтирует устройство (или смонтировать вручную).
-            # Ниже приводится пример упрощённого поиска точки монтирования.
-            # В реальности вы можете использовать вызов `lsblk -o NAME,MOUNTPOINT` или 
-            # парсить содержимое /proc/mounts, чтобы получить точку монтирования.
-            
-            time.sleep(3)  # Даем системе время смонтировать
-
-            mount_path = find_mount_path(device.device_node)
-            if mount_path:
-                print(f"[INFO] Найдена точка монтирования: {mount_path}")
-                monitor_usb_mount(mount_path)
-            else:
-                print("[WARNING] Не удалось определить точку монтирования. "
-                      "Устройство может не быть смонтировано автоматически.")
-
-
 def find_mount_path(device_node):
     """
-    Упрощённый вариант поиска точки монтирования для устройства.
-    Пробегаемся по /proc/mounts и ищем совпадение по названию устройства.
-    Например, /dev/sdb1 -> /media/usb или /run/media/пользователь/usb и т.д.
+    Упрощённо ищем точку монтирования, проверяя /proc/mounts.
+    Ищем строку, где dev == device_node (например, /dev/sdb1).
     """
     try:
         with open("/proc/mounts", "r") as f:
@@ -130,9 +84,40 @@ def find_mount_path(device_node):
                     if dev == device_node:
                         return mnt
     except Exception as e:
-        print(f"[ERROR] Ошибка при парсинге /proc/mounts: {e}")
+        logging.error(f"Ошибка при парсинге /proc/mounts: {e}")
     return None
 
+def main():
+    """
+    Главный цикл: слушаем события block (диски/разделы). Если это USB, пытаемся найти точку монтирования.
+    """
+    context = pyudev.Context()
+    # Фильтруем только подсистему "block" (чтобы ловить и диски, и разделы).
+    monitor = pyudev.Monitor.from_netlink(context)
+    monitor.filter_by(subsystem='block')
+
+    logging.info("Ожидание подключения USB-устройств...")
+
+    # monitor.poll() — блокирующий вызов, будем крутиться в for-цикле.
+    for device in iter(monitor.poll, None):
+        if device.action == 'add':
+            # Проверяем, действительно ли это USB
+            if device.get('ID_BUS') == 'usb':
+                dev_node = device.device_node     # Например, /dev/sdb или /dev/sdb1
+                dev_type = device.get('DEVTYPE')  # Может быть 'disk' или 'partition'
+
+                logging.info(f"Обнаружено USB-устройство: {dev_node} (тип: {dev_type})")
+
+                # Дадим время системе смонтировать
+                time.sleep(2)
+
+                # Пытаемся найти точку монтирования
+                mount_path = find_mount_path(dev_node)
+                if mount_path:
+                    logging.info(f"Точка монтирования найдена: {mount_path}")
+                    monitor_usb_mount(mount_path)
+                else:
+                    logging.warning(f"Не удалось найти точку монтирования для {dev_node}.")
 
 if __name__ == "__main__":
     main()
